@@ -1,0 +1,31 @@
+model: Qwen/Qwen3-1.7B
+reward_funcs:
+  - accuracy_reward
+  - get_soft_overlong_punishment
+soft_punishment_ratio: 0.8
+train_dataset_name: FiorenzoParascandolo/MetaMathQA-60k
+train_dataset_config: null
+train_dataset_split: train
+eval_dataset_name: null
+eval_dataset_config: null
+eval_dataset_split: test
+processing_class_name: null
+reward_processing_class_name: null
+callbacks: null
+optimizers:
+  - null
+  - null
+peft_config:
+  task_type: CAUSAL_LM
+  r: 8
+  lora_alpha: 16
+  lora_dropout: 0.0
+  target_modules:
+    - q_proj
+    - k_proj
+    - v_proj
+    - o_proj
+  bias: none
+tools: null
+rollout_func: null
+environment_factory: null

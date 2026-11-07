@@ -1,0 +1,1376 @@
+# Copyright 2020-2026 The HuggingFace Team. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import argparse
+import base64
+import json
+import logging
+import os
+import re
+import time
+import uuid
+from collections.abc import Sequence
+from contextlib import asynccontextmanager
+from dataclasses import dataclass, field
+from io import BytesIO
+from itertools import chain
+from multiprocessing.connection import Connection
+
+import torch
+import torch.distributed.distributed_c10d as c10d
+from packaging.version import Version
+from transformers import AutoTokenizer, is_torch_xpu_available, is_vision_available
+
+from trl import TrlParser
+from trl.generation.vllm_generation import sanitize_logprob
+from trl.import_utils import (
+    is_fastapi_available,
+    is_pydantic_available,
+    is_uvicorn_available,
+    is_vllm_ascend_available,
+    is_vllm_available,
+)
+from trl.scripts._vllm_workers import local_worker_count, weight_sync_host, worker_connections
+
+
+if is_fastapi_available():
+    from fastapi import FastAPI
+
+
+if is_pydantic_available():
+    from pydantic import BaseModel
+
+
+if is_uvicorn_available():
+    import uvicorn
+
+
+if is_vision_available():
+    from PIL import Image
+
+
+if is_vllm_available():
+    import vllm
+    from vllm import LLM, SamplingParams
+    from vllm.distributed.device_communicators.pynccl import PyNcclCommunicator
+    from vllm.distributed.parallel_state import get_world_group
+    from vllm.distributed.utils import StatelessProcessGroup
+
+    if Version(vllm.__version__) <= Version("0.11.0"):
+        from vllm.utils import get_open_port
+    else:
+        from vllm.utils.network_utils import get_open_port
+
+    if Version(vllm.__version__) <= Version("0.10.2"):
+        from vllm.sampling_params import GuidedDecodingParams
+    else:
+        from vllm.sampling_params import StructuredOutputsParams
+
+    if is_vllm_ascend_available():
+        from vllm_ascend.distributed.device_communicators.pyhccl import PyHcclCommunicator as PyNcclCommunicator
+
+
+logger = logging.getLogger(__name__)
+
+# We use CUDA with multiprocessing, so we must use the 'spawn' start method. Otherwise, we will get the following
+# error: RuntimeError: Cannot re-initialize CUDA in forked subprocess. To use CUDA with multiprocessing, you must use
+# the 'spawn' start method
+os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
+
+
+class WeightSyncWorkerExtension:
+    """
+    A vLLM worker extension that enables weight synchronization between a client and multiple server workers.
+
+    This worker uses a `StatelessProcessGroup` to establish communication and a `PyNcclCommunicator` or
+    `ProcessGroupXCCL` to handle efficient GPU-based communication using NCCL. The primary purpose of this class is to
+    receive updated model weights from a client process and distribute them to all worker processes participating in
+    model inference.
+    """
+
+    # The following attributes are initialized when `init_communicator` method is called.
+    communicator = None  # Communicator for weight updates
+    client_rank = None  # Source rank for broadcasting updated weights
+
+    def init_communicator(self, host: str, port: int, world_size: int, client_device_uuid: str) -> None:
+        """
+        Initializes the weight update communicator using a stateless process group.
+
+        This method creates a `StatelessProcessGroup` that allows external training processes to communicate with vLLM
+        workers without interfering with the global torch distributed group.
+
+        Args:
+            host (`str`):
+                Hostname or IP address of the master node.
+            port (`int`):
+                Port number to be used for communication.
+            world_size (`int`):
+                Total number of participating processes in the update group.
+            client_device_uuid (`str`):
+                UUID of the device of client main process. Used to assert that devices are different from vllm workers
+                devices.
+        """
+        if self.communicator is not None:
+            raise RuntimeError("Weight update group already initialized. Call close_communicator first.")
+
+        # TODO: will remove after torch xpu 2.9 support uuid in get_device_properties
+        if torch.cuda.is_available() or (
+            is_torch_xpu_available() and hasattr(torch.xpu.get_device_properties(self.device), "uuid")
+        ):
+            accelerator_module = torch.xpu if is_torch_xpu_available() else torch.cuda
+            if client_device_uuid == str(accelerator_module.get_device_properties(self.device).uuid):
+                raise RuntimeError(
+                    f"Attempting to use the same CUDA device (UUID: {client_device_uuid}) for multiple distinct "
+                    "roles/ranks within the same communicator. This setup is unsupported and will likely lead to program "
+                    "hangs or incorrect behavior. Ensure that trainer is using different devices than vLLM server."
+                )
+        # Get the rank of the current worker in the global world group.
+        rank = get_world_group().rank
+
+        if is_torch_xpu_available():
+            store = torch.distributed.TCPStore(host_name=host, port=port, world_size=world_size, is_master=(rank == 0))
+            prefixed_store = c10d.PrefixStore("client2server", store)
+            xccl_options = c10d.ProcessGroupXCCL.Options()
+            pg = c10d.ProcessGroupXCCL(
+                store=prefixed_store,
+                rank=rank,
+                size=world_size,
+                options=xccl_options,
+            )
+            self.communicator = pg
+        else:
+            # Create a stateless process group to manage communication between training processes and vLLM workers.
+            # Initialize the NCCL-based communicator for weight synchronization.
+            pg = StatelessProcessGroup.create(host=host, port=port, rank=rank, world_size=world_size)
+            self.communicator = PyNcclCommunicator(pg, device=self.device)
+
+        # The client process that sends updated weights has the highest rank (world_size - 1).
+        self.client_rank = world_size - 1
+
+    def update_named_param(self, name: str, dtype: str, shape: Sequence[int]) -> None:
+        """
+        Receives updated weights from the client process and updates the named parameter in the model.
+
+        Args:
+            name (`str`):
+                Name of the weight tensor being updated.
+            dtype (`str`):
+                Data type of the weight tensor as a string (e.g., `"torch.float32"`).
+            shape (`Sequence[int]`):
+                Shape of the weight tensor.
+        """
+        if self.communicator is None:
+            raise RuntimeError("Communicator not initialized. Call `init_communicator` first.")
+
+        dtype = getattr(torch, dtype.split(".")[-1])
+        # Allocate memory for the incoming weight tensor on the correct device.
+        weight = torch.empty(shape, dtype=dtype, device=self.device)
+
+        if is_torch_xpu_available():
+            # Use XCCL to broadcast the updated weights from the client (src) to all workers.
+            self.communicator.broadcast(weight, root=self.client_rank)
+            self.communicator.barrier()
+        else:
+            # Use NCCL to broadcast the updated weights from the client (src) to all workers.
+            self.communicator.broadcast(weight, src=self.client_rank)
+            self.communicator.group.barrier()
+
+        # Load the received weights into the model.
+        self.model_runner.model.load_weights(weights=[(name, weight)])
+
+    def close_communicator(self) -> None:
+        """
+        Closes the communicator when weight synchronization is no longer needed.
+
+        This method deletes the NCCL communicator to release associated resources.
+        """
+
+        if self.communicator is not None:
+            del self.communicator
+            self.communicator = None  # Ensure attribute is reset to None
+            self.client_rank = None  # Ensure attribute is reset to None
+
+
+@dataclass
+class ScriptArguments:
+    r"""
+    Arguments for the script.
+
+    Args:
+        model (`str`):
+            Model name or path to load the model from.
+        revision (`str`, *optional*):
+            Revision to use for the model. If not specified, the default branch will be used.
+        tensor_parallel_size (`int`, *optional*, defaults to `1`):
+            Number of tensor parallel workers to use.
+        data_parallel_size (`int`, *optional*, defaults to `1`):
+            Number of data parallel workers to use.
+        data_parallel_size_local (`int`, *optional*):
+            Workers on each inference node. Defaults to `data_parallel_size` for single-node serving.
+        data_parallel_node_rank (`int`, *optional*, defaults to `0`):
+            Inference node rank. Only node 0 hosts the HTTP API.
+        data_parallel_master_host (`str`, *optional*):
+            Routable address of inference node 0, required for multi-node serving.
+        data_parallel_master_port (`int`, *optional*):
+            Shared vLLM DP rendezvous port, required for multi-node serving.
+        worker_port (`int`, *optional*):
+            TCP control port on node 0. Multi-node workers require the same `TRL_VLLM_WORKER_AUTHKEY` environment value.
+        worker_connection_timeout (`float`, *optional*, defaults to `900.0`):
+            Time for remote workers to connect to node 0.
+        host (`str`, *optional*, defaults to `"0.0.0.0"`):
+            Host address to run the server on.
+        port (`int`, *optional*, defaults to `8000`):
+            Port to run the server on.
+        gpu_memory_utilization (`float`, *optional*, defaults to `0.9`):
+            Ratio (between 0 and 1) of GPU memory to reserve for the model weights, activations, and KV cache on the
+            device dedicated to generation powered by vLLM. Higher values will increase the KV cache size and thus
+            improve the model's throughput. However, if the value is too high, it may cause out-of-memory (OOM) errors
+            during initialization.
+        dtype (`str`, *optional*, defaults to `"auto"`):
+            Data type to use for vLLM generation. If set to `"auto"`, the data type will be automatically determined
+            based on the model configuration. Find the supported values in the vLLM documentation.
+        max_model_len (`int`, *optional*):
+            If set, the `max_model_len` to use for vLLM. This can be useful when running with reduced
+            `vllm_gpu_memory_utilization`, leading to a reduced KV cache size. If not set, vLLM will use the model
+            context size, which might be much larger than the KV cache, leading to inefficiencies.
+        enable_prefix_caching (`bool`, *optional*):
+            Whether to enable prefix caching in vLLM. If set to `True`, ensure that the model and the hardware support
+            this feature.
+        enable_log_stats (`bool`, *optional*, defaults to `False`):
+            Whether to enable periodic vLLM engine stats logging, including KV cache usage and prefix cache hit rate.
+        enforce_eager (`bool`, *optional*, defaults to `False`):
+            Whether to enforce eager execution. If set to `True`, we will disable CUDA graph and always execute the
+            model in eager mode. If `False` (default behavior), we will use CUDA graph and eager execution in hybrid.
+        vllm_model_impl (`str`, *optional*, defaults to `"vllm"`):
+            Model implementation to use for vLLM. Must be one of `"transformers"` or `"vllm"`. `"transformers"`: Use
+            the `transformers` backend for model implementation. `"vllm"`: Use the `vllm` library for model
+            implementation.
+        kv_cache_dtype (`str`, *optional*, defaults to `"auto"`):
+            Data type to use for KV cache. If set to `"auto"`, the dtype will default to the model data type.
+        trust_remote_code (`bool`, *optional*, defaults to `False`):
+            Whether to trust remote code when loading models. Set to `True` to allow executing code from model
+            repositories. This is required for some custom models but introduces security risks.
+        log_level (`str`, *optional*, defaults to `"info"`):
+            Log level for uvicorn. Possible choices: `"critical"`, `"error"`, `"warning"`, `"info"`, `"debug"`,
+            `"trace"`.
+    """
+
+    model: str = field(
+        metadata={"help": "Model name or path to load the model from."},
+    )
+    revision: str | None = field(
+        default=None,
+        metadata={"help": "Revision to use for the model. If not specified, the default branch will be used."},
+    )
+    tensor_parallel_size: int = field(
+        default=1,
+        metadata={"help": "Number of tensor parallel workers to use."},
+    )
+    data_parallel_size: int = field(
+        default=1,
+        metadata={"help": "Number of data parallel workers to use."},
+    )
+    data_parallel_size_local: int | None = field(
+        default=None, metadata={"help": "Number of data parallel workers per inference node."}
+    )
+    data_parallel_node_rank: int = field(
+        default=0, metadata={"help": "Inference node rank; node 0 serves the HTTP API."}
+    )
+    data_parallel_master_host: str | None = field(
+        default=None, metadata={"help": "Routable address of inference node 0."}
+    )
+    data_parallel_master_port: int | None = field(
+        default=None, metadata={"help": "Shared vLLM data parallel rendezvous port."}
+    )
+    worker_port: int | None = field(
+        default=None, metadata={"help": "Authenticated TCP worker control port on inference node 0."}
+    )
+    worker_connection_timeout: float = field(
+        default=900.0, metadata={"help": "Remote worker connection timeout in seconds."}
+    )
+    host: str = field(
+        default="0.0.0.0",
+        metadata={"help": "Host address to run the server on."},
+    )
+    port: int = field(
+        default=8000,
+        metadata={"help": "Port to run the server on."},
+    )
+    gpu_memory_utilization: float = field(
+        default=0.9,
+        metadata={
+            "help": "Ratio (between 0 and 1) of GPU memory to reserve for the model weights, activations, and KV "
+            "cache on the device dedicated to generation powered by vLLM. Higher values will increase the KV cache "
+            "size and thus improve the model's throughput. However, if the value is too high, it may cause "
+            "out-of-memory (OOM) errors during initialization."
+        },
+    )
+    dtype: str = field(
+        default="auto",
+        metadata={
+            "help": "Data type to use for vLLM generation. If set to 'auto', the data type will be automatically "
+            "determined based on the model configuration. Find the supported values in the vLLM documentation."
+        },
+    )
+    max_model_len: int | None = field(
+        default=None,
+        metadata={
+            "help": "If set, the `max_model_len` to use for vLLM. This can be useful when running with reduced "
+            "`vllm_gpu_memory_utilization`, leading to a reduced KV cache size. If not set, vLLM will use the model "
+            "context size, which might be much larger than the KV cache, leading to inefficiencies."
+        },
+    )
+    enable_prefix_caching: bool | None = field(
+        default=None,
+        metadata={
+            "help": "Whether to enable prefix caching in vLLM. If set to `True`, ensure that the model and the "
+            "hardware support this feature."
+        },
+    )
+    enable_log_stats: bool = field(
+        default=False,
+        metadata={
+            "help": "Enable periodic vLLM engine stats logging, including KV cache usage and prefix cache hit rate."
+        },
+    )
+    enforce_eager: bool | None = field(
+        default=False,
+        metadata={
+            "help": "Whether to enforce eager execution. If set to `True`, we will disable CUDA graph and always "
+            "execute the model in eager mode. If `False` (default behavior), we will use CUDA graph and eager "
+            "execution in hybrid."
+        },
+    )
+    kv_cache_dtype: str = field(
+        default="auto",
+        metadata={
+            "help": "Data type to use for KV cache. If set to 'auto', the dtype will default to the model data type."
+        },
+    )
+    trust_remote_code: bool = field(
+        default=False,
+        metadata={
+            "help": "Whether to trust remote code when loading models. Set to True to allow executing code from model "
+            "repositories. This is required for some custom models but introduces security risks."
+        },
+    )
+    log_level: str = field(
+        default="info",
+        metadata={
+            "help": "Log level for uvicorn. Possible choices: 'critical', 'error', 'warning', 'info', 'debug', "
+            "'trace'."
+        },
+    )
+    vllm_model_impl: str = field(
+        default="vllm",
+        metadata={
+            "help": "Model implementation to use for vLLM. Must be one of `transformers` or `vllm`. `transformers`: "
+            "Use the `transformers` backend for model implementation. `vllm`: Use the `vllm` library for "
+            "model implementation."
+        },
+    )
+
+
+def llm_worker(
+    script_args: ScriptArguments, data_parallel_rank: int, master_port: int, connection: Connection
+) -> None:
+    # Set required environment variables for DP to work with vLLM
+    os.environ["VLLM_DP_RANK"] = str(data_parallel_rank)
+    os.environ["VLLM_DP_RANK_LOCAL"] = str(data_parallel_rank % local_worker_count(script_args))
+    os.environ["VLLM_DP_SIZE"] = str(script_args.data_parallel_size)
+    os.environ["VLLM_DP_MASTER_PORT"] = str(master_port)
+    if script_args.data_parallel_master_host:
+        os.environ["VLLM_DP_MASTER_IP"] = script_args.data_parallel_master_host
+
+    llm = LLM(
+        model=script_args.model,
+        revision=script_args.revision,
+        tensor_parallel_size=script_args.tensor_parallel_size,
+        gpu_memory_utilization=script_args.gpu_memory_utilization,
+        enforce_eager=script_args.enforce_eager,
+        dtype=script_args.dtype,
+        # Automatic Prefix Caching caches the KV cache of existing queries, so that a new query can
+        # directly reuse the KV cache if it shares the same prefix with one of the existing queries.
+        # This is particularly useful here because we generate completions from the same prompts.
+        enable_prefix_caching=script_args.enable_prefix_caching,
+        kv_cache_dtype=script_args.kv_cache_dtype,
+        max_model_len=script_args.max_model_len,
+        worker_extension_cls="trl.scripts.vllm_serve.WeightSyncWorkerExtension",
+        trust_remote_code=script_args.trust_remote_code,
+        model_impl=script_args.vllm_model_impl,
+        # Important so temperature scaling/logit tweaking affects the TIS log probs
+        logprobs_mode="processed_logprobs",
+        disable_log_stats=not script_args.enable_log_stats,
+    )
+
+    # Send ready signal to parent process
+    connection.send({"status": "ready"})
+
+    while True:
+        # Wait for commands from the parent process
+        try:
+            command = connection.recv()
+        except (KeyboardInterrupt, EOFError):
+            llm.collective_rpc(method="close_communicator")
+            break
+
+        # Handle commands
+        if command["type"] in ["call", "fire_and_forget"]:
+            method_name = command["method"]
+            args, kwargs = command.get("args", ()), command.get("kwargs", {})
+            method = getattr(llm, method_name)
+
+            try:
+                result = method(*args, **kwargs)
+            except ValueError as e:
+                error_msg = str(e)
+                if "longer than the maximum model length" in error_msg or "context length" in error_msg:
+                    logger.error(f"[Worker] Context length exceeded: {error_msg}")
+                    if method_name in ["generate", "chat"]:
+                        result = []
+                    else:
+                        raise
+                else:
+                    raise
+            except Exception as e:
+                logger.error(f"[Worker] Unexpected error in {method_name}: {e}")
+                raise
+
+            if command["type"] == "call":
+                connection.send(result)
+        elif command["type"] == "shutdown":
+            break
+
+
+def chunk_list(lst: list, n: int) -> list[list]:
+    """
+    Split list `lst` into `n` evenly distributed sublists.
+
+    Example:
+    ```python
+    >>> chunk_list([1, 2, 3, 4, 5, 6], 2)
+    [[1, 2, 3], [4, 5, 6]]
+
+    >>> chunk_list([1, 2, 3, 4, 5, 6], 4)
+    [[1, 2], [3, 4], [5], [6]]
+
+    >>> chunk_list([1, 2, 3, 4, 5, 6], 8)
+    [[1], [2], [3], [4], [5], [6], [], []]
+    ```
+    """
+    k, r = divmod(len(lst), n)
+    return [lst[i * k + min(i, r) : (i + 1) * k + min(i + 1, r)] for i in range(n)]
+
+
+def _replace_prefix_tokens(
+    tokenizer,
+    model_prefix_token_ids: list[int],
+    template_prefix_token_ids: list[int],
+    template_token_ids: list[int],
+) -> list[int]:
+    """
+    This function is for fixing up the chat template-tokenized messages history to match the model output tokenization
+    up to the last assistant turn, in order to preserve the monotonic tokens property for optimized multi-turn
+    training.
+
+    RL training frameworks train models on token IDs, but the OpenAI compatible server communicates in what is
+    basically de-tokenized text. When multiple model calls are made to the OpenAI compatible server in a single
+    trajectory, model generations in previous model calls may be re-tokenized to something that is different than what
+    was generated. This is not too big of an issue (that we know of) at inference time, but the log probs the model
+    produces are different enough for the differently re-tokenized generation result that it causes the training to be
+    off policy. Off policy isn't necessarily a bad thing in isolation, but this source of off-policyness may cause
+    unexpected issues if not properly accounted for. It also mis-aligns the token ID sequences across model calls,
+    which is strange during training.
+
+    There are real cases where the model output string _does not match_ the chat template tokenization of the parsed
+    model output. A concrete example is inconsistent whitespace tokens around tool call special tokens.
+
+    Based on NeMo RL's _replace_prefix_tokens:
+    https://github.com/NVIDIA-NeMo/RL/blob/748b9caff4e6d672b8a98a10b6e612d028cfc96b/nemo_rl/models/generation/vllm/vllm_worker_async.py#L40
+    """
+    if not model_prefix_token_ids:
+        return template_token_ids
+
+    eos_token_id = tokenizer.eos_token_id
+    if eos_token_id is None:
+        logger.warning("Tokenizer has no EOS token ID, cannot apply _replace_prefix_tokens")
+        return template_token_ids
+
+    model_cut_end = len(model_prefix_token_ids)
+    if model_prefix_token_ids and model_prefix_token_ids[-1] == eos_token_id:
+        model_cut_end -= 1
+
+    # We take everything starting with the EOS token ID.
+    template_cut_start = -1
+    for pos in reversed(range(len(template_prefix_token_ids))):
+        if template_token_ids[pos] == eos_token_id:
+            template_cut_start = pos
+            break
+
+    # This should never be the case, but
+    if template_cut_start < 0:
+        logger.warning("No EOS token found in template prefix, cannot apply _replace_prefix_tokens")
+        return template_token_ids
+
+    result = model_prefix_token_ids[:model_cut_end] + template_token_ids[template_cut_start:]
+
+    return result
+
+
+def main(script_args: ScriptArguments):
+    if not is_fastapi_available():
+        raise ImportError(
+            "FastAPI is required to run the vLLM serve script. Please install it using `pip install fastapi`."
+        )
+
+    if not is_pydantic_available():
+        raise ImportError(
+            "Pydantic is required to run the vLLM serve script. Please install it using `pip install pydantic`."
+        )
+
+    if not is_uvicorn_available():
+        raise ImportError(
+            "Uvicorn is required to run the vLLM serve script. Please install it using `pip install uvicorn`."
+        )
+
+    if not is_vllm_available():
+        raise ImportError("vLLM is required to run the vLLM serve script. Please install it using `pip install vllm`.")
+
+    local_worker_count(script_args)  # Validate the topology before starting any workers.
+    master_port = script_args.data_parallel_master_port or get_open_port()
+    with worker_connections(script_args, master_port, llm_worker) as connections:
+        if connections is not None:
+            _serve_http(script_args, connections)
+
+
+def _serve_http(script_args: ScriptArguments, connections: list[Connection]):
+    @asynccontextmanager
+    async def lifespan(app: FastAPI):
+        logger.info(f"Loading tokenizer for {script_args.model}...")
+        app.state.tokenizer = AutoTokenizer.from_pretrained(
+            script_args.model, trust_remote_code=script_args.trust_remote_code
+        )
+
+        # Wait for all workers to send "ready"
+        ready_connections = set()
+        while len(ready_connections) < script_args.data_parallel_size:
+            for connection in connections:
+                msg = connection.recv()
+                if isinstance(msg, dict) and msg.get("status") == "ready":
+                    ready_connections.add(connection)
+
+        yield
+
+    app = FastAPI(lifespan=lifespan)
+
+    # Define the endpoints for the model server
+    @app.get("/health/")
+    async def health():
+        """
+        Health check endpoint to verify that the server is running.
+        """
+        return {"status": "ok"}
+
+    @app.get("/get_world_size/")
+    async def get_world_size():
+        """
+        Retrieves the world size of the LLM engine, which is `tensor_parallel_size * data_parallel_size`.
+
+        Returns:
+            `dict`:
+                A dictionary containing the world size.
+
+        Example response:
+        ```json
+        {"world_size": 8}
+        ```
+        """
+        return {"world_size": script_args.tensor_parallel_size * script_args.data_parallel_size}
+
+    class GenerateRequest(BaseModel):
+        prompts: list[str | dict[str, list[int]]]
+        images: list[str] | None = None
+        n: int = 1
+        repetition_penalty: float = 1.0
+        temperature: float = 1.0
+        top_p: float = 1.0
+        top_k: int = -1
+        min_p: float = 0.0
+        max_tokens: int = 16
+        truncate_prompt_tokens: int | None = None
+        structured_outputs_regex: str | None = None
+        generation_kwargs: dict = field(default_factory=dict)
+        max_tokens_by_prompt: list[int] | None = None
+
+    class GenerateResponse(BaseModel):
+        prompt_ids: list[list[int]]
+        completion_ids: list[list[int]]
+        logprobs: list[list[float]]
+        entropies: list[list[float]]
+
+    @app.post("/generate/", response_model=GenerateResponse)
+    async def generate(request: GenerateRequest):
+        """
+        Generates completions for the provided prompts.
+
+        Args:
+            request (`GenerateRequest`):
+                - `prompts` (list of `str`): A list of prompts (text strings) for the model to generate completions.
+                - `images` (list of `str`, *optional*, default to `None`): A list of base64 encoded images to process
+                  along with prompts.
+                - `n` (`int`, *optional*, defaults to `1`): Number of completions to generate for each prompt.
+                - `repetition_penalty` (`float`, *optional*, defaults to `1.0`): Repetition penalty to apply during
+                  generation.
+                - `temperature` (`float`, *optional*, defaults to `1.0`): Temperature for sampling. Higher values lead
+                  to more random outputs.
+                - `top_p` (`float`, *optional*, defaults to `1.0`): Top-p (nucleus) sampling parameter. It controls the
+                  diversity of the generated text.
+                - `top_k` (`int`, *optional*, defaults to `-1`): Top-k sampling parameter. If set to `-1`, it disables
+                  top-k sampling.
+                - `min_p` (`float`, *optional*, defaults to `0.0`): Minimum probability threshold for sampling.
+                - `max_tokens` (`int`, *optional*, defaults to `16`): Maximum number of tokens to generate for each
+                  completion.
+                - `truncate_prompt_tokens` (`int`, *optional*): If set to `-1`, will use the truncation size supported
+                  by the model. If set to an integer k, will use only the last k tokens from the prompt (i.e., left
+                  truncation). If set to `None`, truncation is disabled.
+                - `structured_outputs_regex` (`str`, *optional*): A regex pattern for structured outputs. If provided,
+                  the model will only generate tokens that match this regex pattern.
+                - `generation_kwargs` (`dict`, *optional*): Additional generation parameters to pass to the vLLM
+                  `SamplingParams`. This can include parameters like `seed`, `frequency_penalty`, etc. If it contains
+                  keys that conflict with the other parameters, they will override them.
+
+        Returns:
+            `GenerateResponse`:
+                - `prompt_ids` (list of list of `int`): A list of lists of token IDs for each input prompt.
+                - `completion_ids` (list of list of `int`): A list of lists of token IDs for each generated completion.
+                - `logprobs` (list of list of `float`): A list of lists of log probabilities for each token in the
+                  generated completions.
+                - `entropies` (list of list of `float`): A list of lists of token-distribution entropies for each
+                  token in the generated completions.
+
+        Example request:
+        ```json
+        {"prompts": ["Hello world", "What is AI?"]}
+        ```
+
+        Example response:
+        ```json
+        {
+          "prompt_ids": [[101, 102], [201, 202]],
+          "completion_ids": [[103, 104, 105], [203, 204, 205]],
+          "logprobs": [[-0.1, -0.2, -0.3], [-0.4, -0.5, -0.6]]
+        }
+        ```
+        """
+        request.images = request.images or [None] * len(request.prompts)
+        if request.max_tokens_by_prompt is not None and len(request.max_tokens_by_prompt) != len(request.prompts):
+            raise ValueError("`max_tokens_by_prompt` must have the same length as `prompts`.")
+
+        prompts = []
+        for prompt, image in zip(request.prompts, request.images, strict=True):
+            row = dict(prompt) if isinstance(prompt, dict) else {"prompt": prompt}
+            if image is not None:
+                row["multi_modal_data"] = {"image": Image.open(BytesIO(base64.b64decode(image)))}
+            prompts.append(row)
+
+        # Structured outputs, if enabled
+        if Version(vllm.__version__) <= Version("0.10.2"):
+            structured_outputs_key = "guided_decoding"
+            if request.structured_outputs_regex is not None:
+                structured_outputs = GuidedDecodingParams(regex=request.structured_outputs_regex)
+            else:
+                structured_outputs = None
+        else:
+            structured_outputs_key = "structured_outputs"
+            if request.structured_outputs_regex is not None:
+                structured_outputs = StructuredOutputsParams(regex=request.structured_outputs_regex)
+            else:
+                structured_outputs = None
+
+        generation_kwargs = {
+            "n": request.n,
+            "repetition_penalty": request.repetition_penalty,
+            "temperature": request.temperature,
+            "top_p": request.top_p,
+            "top_k": request.top_k,
+            "min_p": request.min_p,
+            "max_tokens": request.max_tokens,
+            "truncate_prompt_tokens": request.truncate_prompt_tokens,
+            "logprobs": 0,  # enable returning log probabilities; 0 means for the sampled tokens only
+        }
+        generation_kwargs[structured_outputs_key] = structured_outputs
+        generation_kwargs.update(request.generation_kwargs)
+        sampling_params = SamplingParams(**generation_kwargs)
+        sampling_params_by_prompt = None
+        if request.max_tokens_by_prompt is not None:
+            sampling_params_by_prompt = []
+            for max_tokens in request.max_tokens_by_prompt:
+                prompt_generation_kwargs = dict(generation_kwargs)
+                prompt_generation_kwargs["max_tokens"] = max(1, int(max_tokens))
+                sampling_params_by_prompt.append(SamplingParams(**prompt_generation_kwargs))
+
+        # Evenly distribute prompts across DP ranks
+        chunked_prompts = chunk_list(prompts, script_args.data_parallel_size)
+        chunked_sampling_params = (
+            chunk_list(sampling_params_by_prompt, script_args.data_parallel_size)
+            if sampling_params_by_prompt is not None
+            else [sampling_params] * script_args.data_parallel_size
+        )
+
+        # Send the prompts to each worker
+        for connection, prompts, worker_sampling_params in zip(
+            connections, chunked_prompts, chunked_sampling_params, strict=True
+        ):
+            # When the number of prompts is less than data_parallel_size, some workers will receive empty prompts.
+            # However, vLLM requires that we always send at least one prompt. So we send a placeholder prompt to comply
+            # with vLLM's requirement, and we later ignore the result.
+            if not prompts:
+                prompts = ["<placeholder>"]
+                worker_sampling_params = (
+                    [sampling_params] if sampling_params_by_prompt is not None else sampling_params
+                )
+            kwargs = {"prompts": prompts, "sampling_params": worker_sampling_params}
+            connection.send({"type": "call", "method": "generate", "kwargs": kwargs})
+
+        # Receive results
+        all_outputs = [connection.recv() for connection in connections]
+
+        # Handle empty prompts (see above)
+        all_outputs = [output for output, prompts in zip(all_outputs, chunked_prompts, strict=True) if prompts]
+
+        # Flatten and combine all results
+        all_outputs = list(chain.from_iterable(all_outputs))  # from list of list to single list
+        prompt_ids = [output.prompt_token_ids for output in all_outputs]
+        completion_ids = [list(output.token_ids) for outputs in all_outputs for output in outputs.outputs]
+        logprobs: list[list[float]] = [
+            [sanitize_logprob(next(iter(logprob.values()))) for logprob in output.logprobs]
+            for outputs in all_outputs
+            for output in outputs.outputs
+        ]
+        entropies: list[list[float]] = [
+            [next(iter(logprob.values())).entropy for logprob in output.logprobs]
+            for outputs in all_outputs
+            for output in outputs.outputs
+        ]
+        return {
+            "prompt_ids": prompt_ids,
+            "completion_ids": completion_ids,
+            "logprobs": logprobs,
+            "entropies": entropies,
+        }
+
+    class ChatRequest(BaseModel):
+        messages: list[list[dict]]
+        n: int = 1
+        repetition_penalty: float = 1.0
+        temperature: float = 1.0
+        top_p: float = 1.0
+        top_k: int = -1
+        min_p: float = 0.0
+        max_tokens: int = 16
+        truncate_prompt_tokens: int | None = None
+        structured_outputs_regex: str | None = None
+        generation_kwargs: dict = field(default_factory=dict)
+        chat_template_kwargs: dict = field(default_factory=dict)
+        chat_template: str | None = None
+        tools: list[dict] | None = None
+        add_generation_prompt: bool = True
+        continue_final_message: bool = False
+
+    class ChatResponse(BaseModel):
+        prompt_ids: list[list[int]]
+        completion_ids: list[list[int]]
+        logprobs: list[list[float]]
+        entropies: list[list[float]]
+
+    @app.post("/chat/", response_model=ChatResponse)
+    async def chat(request: ChatRequest):
+        """
+        Generates completions for the provided chat messages.
+
+        Args:
+            request (`ChatRequest`):
+                - `messages` (list of `dict`): A list of messages (dicts with "role" and "content" keys) for the model
+                  to generate completions.
+                - `n` (`int`, *optional*, defaults to `1`): Number of completions to generate for each prompt.
+                - `repetition_penalty` (`float`, *optional*, defaults to `1.0`): Repetition penalty to apply during
+                  generation.
+                - `temperature` (`float`, *optional*, defaults to `1.0`): Temperature for sampling. Higher values lead
+                  to more random outputs.
+                - `top_p` (`float`, *optional*, defaults to `1.0`): Top-p (nucleus) sampling parameter. It controls the
+                  diversity of the generated text.
+                - `top_k` (`int`, *optional*, defaults to `-1`): Top-k sampling parameter. If set to `-1`, it disables
+                  top-k sampling.
+                - `min_p` (`float`, *optional*, defaults to `0.0`): Minimum probability threshold for sampling.
+                - `max_tokens` (`int`, *optional*, defaults to `16`): Maximum number of tokens to generate for each
+                  completion.
+                - `truncate_prompt_tokens` (`int`, *optional*): If set to `-1`, will use the truncation size supported
+                  by the model. If set to an integer k, will use only the last k tokens from the prompt (i.e., left
+                  truncation). If set to `None`, truncation is disabled.
+                - `structured_outputs_regex` (`str`, *optional*): A regex pattern for structured outputs. If provided,
+                  the model will only generate tokens that match this regex pattern.
+                - `generation_kwargs` (`dict`, *optional*): Additional generation parameters to pass to the vLLM
+                  `SamplingParams`. This can include parameters like `seed`, `frequency_penalty`, etc. If it contains
+                  keys that conflict with the other parameters, they will override them.
+                - `chat_template_kwargs` (`dict`, *optional*): Additional keyword arguments to pass to the chat
+                  template.
+                - `add_generation_prompt` (`bool`, *optional*, defaults to `True`): Whether to append a new
+                  assistant message header.
+                - `continue_final_message` (`bool`, *optional*, defaults to `False`): Whether to continue the final
+                  message as a prefill. Requires `add_generation_prompt=False`.
+
+        Returns:
+            `ChatResponse`:
+                - `prompt_ids` (list of list of `int`): A list of lists of token IDs for each input prompt.
+                - `completion_ids` (list of list of `int`): A list of lists of token IDs for each generated completion.
+                - `logprobs` (list of list of `float`): A list of lists of log probabilities for each token in the
+                  generated completions.
+                - `entropies` (list of list of `float`): A list of lists of token-distribution entropies for each
+                  token in the generated completions.
+
+        Example request:
+        ```bash
+        curl -X POST 'http://0.0.0.0:8000/chat/' \
+          -H 'Content-Type: application/json' \
+          -d '{"messages": [[{ "role": "user", "content": "Hello!" }]]}'
+        ```
+
+        Example response:
+        ```json
+        {
+            "prompt_ids": [[151644, 872, 198, 9707, 0, 151645, 198, 151644, 77091, 198]],
+            "completion_ids":[[151667, 198, 32313, 11, 279, 1196, 1101, 1053, 330, 9707, 8958, 773, 358, 1184, 311, 5889]],
+            "logprobs": [[-0.00029404606902971864, -3.576278118089249e-07, -0.09024181962013245, -6.389413465512916e-05, -0.038671817630529404, -0.00013314791431184858, -0.5868351459503174, -0.09682723134756088, -0.06609706580638885, -0.00023803261865396053, -0.02242819033563137, -0.8185162544250488, -0.04954879730939865, -0.3169460594654083, -4.887569048150908e-06, -0.006023705471307039]]
+        }
+        ```
+        """
+        # Convert PIL images to base64 strings
+        for message_list in request.messages:
+            for message in message_list:
+                if isinstance(message["content"], list):
+                    for part in message["content"]:
+                        if part["type"] == "image_pil":
+                            part["image_pil"] = Image.open(BytesIO(base64.b64decode(part["image_pil"])))
+
+        # Structured outputs, if enabled
+        if Version(vllm.__version__) <= Version("0.10.2"):
+            structured_outputs_key = "guided_decoding"
+            if request.structured_outputs_regex is not None:
+                structured_outputs = GuidedDecodingParams(regex=request.structured_outputs_regex)
+            else:
+                structured_outputs = None
+        else:
+            structured_outputs_key = "structured_outputs"
+            if request.structured_outputs_regex is not None:
+                structured_outputs = StructuredOutputsParams(regex=request.structured_outputs_regex)
+            else:
+                structured_outputs = None
+
+        generation_kwargs = {
+            "n": request.n,
+            "repetition_penalty": request.repetition_penalty,
+            "temperature": request.temperature,
+            "top_p": request.top_p,
+            "top_k": request.top_k,
+            "min_p": request.min_p,
+            "max_tokens": request.max_tokens,
+            "truncate_prompt_tokens": request.truncate_prompt_tokens,
+            "logprobs": 0,  # enable returning log probabilities; 0 means for the sampled tokens only
+        }
+        generation_kwargs[structured_outputs_key] = structured_outputs
+        generation_kwargs.update(request.generation_kwargs)
+        sampling_params = SamplingParams(**generation_kwargs)
+
+        # Evenly distribute prompts across DP ranks
+        chunked_messages = chunk_list(request.messages, script_args.data_parallel_size)
+
+        # Send the messages to each worker
+        for connection, messages in zip(connections, chunked_messages, strict=True):
+            # When the number of messages is less than data_parallel_size, some workers will receive empty messages.
+            # However, vLLM requires that we always send at least one prompt. So we send a placeholder prompt to comply
+            # with vLLM's requirement, and we later ignore the result.
+            if not messages:
+                messages = [[{"role": "user", "content": "<placeholder>"}]]
+            kwargs = {
+                "messages": messages,
+                "sampling_params": sampling_params,
+                "chat_template_kwargs": request.chat_template_kwargs,
+                "chat_template": request.chat_template,
+                "tools": request.tools if request.tools else None,
+                "add_generation_prompt": request.add_generation_prompt,
+                "continue_final_message": request.continue_final_message,
+            }
+
+            connection.send({"type": "call", "method": "chat", "kwargs": kwargs})
+
+        # Receive results
+        all_outputs = [connection.recv() for connection in connections]
+
+        # Handle empty prompts (see above)
+        all_outputs = [output for output, prompts in zip(all_outputs, chunked_messages, strict=True) if prompts]
+
+        # Flatten and combine all results
+        all_outputs = list(chain.from_iterable(all_outputs))  # from list of list to single list
+        prompt_ids = [output.prompt_token_ids for output in all_outputs]
+        completion_ids = [list(output.token_ids) for outputs in all_outputs for output in outputs.outputs]
+        logprobs: list[list[float]] = [
+            [sanitize_logprob(next(iter(logprob.values()))) for logprob in output.logprobs]
+            for outputs in all_outputs
+            for output in outputs.outputs
+        ]
+        entropies: list[list[float]] = [
+            [next(iter(logprob.values())).entropy for logprob in output.logprobs]
+            for outputs in all_outputs
+            for output in outputs.outputs
+        ]
+        return {
+            "prompt_ids": prompt_ids,
+            "completion_ids": completion_ids,
+            "logprobs": logprobs,
+            "entropies": entropies,
+        }
+
+    class InitCommunicatorRequest(BaseModel):
+        host: str
+        port: int
+        world_size: int
+        client_device_uuid: str
+
+    @app.post("/init_communicator/")
+    async def init_communicator(request: InitCommunicatorRequest):
+        """
+        Initializes the communicator for synchronizing model weights between a client and multiple server workers.
+
+        Args:
+            request (`InitCommunicatorRequest`):
+                - `host` (`str`): Hostname or IP address of the master node.
+                - `port` (`int`): Port number to be used for communication.
+                - `world_size` (`int`): Total number of participating processes in the group.
+                - `client_device_uuid` (`str`): UUID of the device of client main process. Used to assert that devices
+                  are different from vLLM workers devices.
+        """
+        world_size = script_args.tensor_parallel_size * script_args.data_parallel_size + 1
+
+        # The function init_communicator is called this way: init_communicator(host, port, world_size)
+        # So with collective_rpc we need to call it this way:
+        # llm.collective_rpc(method="init_communicator", args=(host, port, world_size))
+        kwargs = {
+            "method": "init_communicator",
+            "args": (
+                weight_sync_host(script_args, request.host),
+                request.port,
+                world_size,
+                request.client_device_uuid,
+            ),
+        }
+        for connection in connections:
+            connection.send({"type": "fire_and_forget", "method": "collective_rpc", "kwargs": kwargs})
+
+        return {"message": "Request received, initializing communicator"}
+
+    class UpdateWeightsRequest(BaseModel):
+        name: str
+        dtype: str
+        shape: list[int]
+
+    @app.post("/update_named_param/")
+    async def update_named_param(request: UpdateWeightsRequest):
+        """
+        Updates the model weights with the provided tensor.
+
+        Once this endpoint is called, the client process should broadcast the updated weights to all server workers.
+
+        Args:
+            request (`UpdateWeightsRequest`):
+                - `name` (`str`): Name of the weight tensor being updated.
+                - `dtype` (`str`): Data type of the weight tensor (e.g., `"torch.float32"`).
+                - `shape` (list of `int`): Shape of the weight
+
+        """
+        # The function update_named_param is called this way: update_named_param("name", "torch.float32", (10, 10))
+        # So with collective_rpc we need to call it this way:
+        # llm.collective_rpc("update_named_param", args=("name", "torch.float32", (10, 10)))
+        kwargs = {"method": "update_named_param", "args": (request.name, request.dtype, tuple(request.shape))}
+        for connection in connections:
+            connection.send({"type": "fire_and_forget", "method": "collective_rpc", "kwargs": kwargs})
+
+        return {"message": "Request received, updating named parameter"}
+
+    @app.post("/reset_prefix_cache/")
+    async def reset_prefix_cache():
+        """
+        Resets the prefix cache for the model.
+        """
+        for connection in connections:
+            connection.send({"type": "call", "method": "reset_prefix_cache"})
+        # Wait for and collect all results
+        all_outputs = [connection.recv() for connection in connections]
+        success = all(output for output in all_outputs)
+        return {"message": "Request received, resetting prefix cache status: " + str(success)}
+
+    @app.post("/close_communicator/")
+    async def close_communicator():
+        """
+        Closes the weight update group and cleans up associated resources.
+        """
+        kwargs = {"method": "close_communicator"}
+        for connection in connections:
+            connection.send({"type": "fire_and_forget", "method": "collective_rpc", "kwargs": kwargs})
+        return {"message": "Request received, closing communicator"}
+
+    class ChatCompletionRequest(BaseModel):
+        messages: list[dict]
+        model: str | None = None
+        temperature: float = 1.0
+        top_p: float = 1.0
+        max_completion_tokens: int | None = None
+        max_tokens: int | None = None
+        n: int = 1
+        stop: str | list[str] | None = None
+        presence_penalty: float = 0.0
+        frequency_penalty: float = 0.0
+        logprobs: bool = False
+        top_logprobs: int | None = None
+        tools: list[dict] | None = None
+        tool_choice: str | dict = "auto"
+        parallel_tool_calls: bool = True
+
+    @app.post("/v1/chat/completions")
+    async def chat_completions(request: ChatCompletionRequest):
+        completion_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
+        created_at = int(time.time())
+
+        messages = []
+        for msg in request.messages:
+            role = msg.get("role", "")
+            if role not in ["system", "user", "assistant", "tool"]:
+                logger.warning(f"Unknown message role: {role}")
+            messages.append(msg)
+
+        max_tokens = request.max_completion_tokens or request.max_tokens or 512
+
+        sampling_kwargs = {
+            "n": request.n,
+            "temperature": request.temperature,
+            "top_p": request.top_p,
+            "max_tokens": max_tokens,
+            "presence_penalty": request.presence_penalty,
+            "frequency_penalty": request.frequency_penalty,
+            "stop": request.stop,
+        }
+
+        if request.logprobs or request.top_logprobs:
+            sampling_kwargs["logprobs"] = request.top_logprobs if request.top_logprobs else 1
+
+        sampling_params = SamplingParams(**sampling_kwargs)
+
+        chat_template_kwargs = {}
+        if request.tool_choice and request.tool_choice != "auto":
+            chat_template_kwargs["tool_choice"] = request.tool_choice
+
+        has_prefix_token_ids = any(msg.get("role") == "assistant" and "prompt_token_ids" in msg for msg in messages)
+
+        if has_prefix_token_ids:
+            # do on policy token id correction and call generate instead of chat
+            # see https://docs.nvidia.com/nemo/gym/latest/contribute/rl-framework-integration/openai-compatible-http-server-on-policy-correction.html
+            # and https://github.com/NVIDIA-NeMo/RL/blob/main/nemo_rl/models/generation/vllm/vllm_worker_async.py#L40
+            tokenizer = app.state.tokenizer
+
+            # preprocess full conversation
+            connections[0].send(
+                {
+                    "type": "call",
+                    "method": "preprocess_chat",
+                    "kwargs": {
+                        "messages": [messages],
+                        "chat_template_kwargs": chat_template_kwargs,
+                        "tools": request.tools,
+                        "add_generation_prompt": True,
+                    },
+                }
+            )
+            template_prompts = connections[0].recv()
+            template_prompt = template_prompts[0]
+
+            # extract model prefix tokens from last assistant message
+            model_prefix_tokens = None
+            last_assistant_idx = None
+            for i in reversed(range(len(messages))):
+                if messages[i].get("role") == "assistant":
+                    last_assistant_idx = i
+                    if "prompt_token_ids" in messages[i]:
+                        model_prefix_tokens = messages[i]["prompt_token_ids"] + messages[i].get(
+                            "generation_token_ids", []
+                        )
+                    break
+
+            if model_prefix_tokens and last_assistant_idx is not None:
+                messages_to_last_assistant = messages[: last_assistant_idx + 1]
+                connections[0].send(
+                    {
+                        "type": "call",
+                        "method": "preprocess_chat",
+                        "kwargs": {
+                            "messages": [messages_to_last_assistant],
+                            "chat_template_kwargs": chat_template_kwargs,
+                            "tools": request.tools,
+                            "add_generation_prompt": False,
+                        },
+                    }
+                )
+                template_prefix_prompts = connections[0].recv()
+                template_prefix_token_ids = template_prefix_prompts[0]["prompt_token_ids"]
+
+                corrected_token_ids = _replace_prefix_tokens(
+                    tokenizer, model_prefix_tokens, template_prefix_token_ids, template_prompt["prompt_token_ids"]
+                )
+
+            else:
+                corrected_token_ids = template_prompt["prompt_token_ids"]
+
+            corrected_prompt = {"prompt_token_ids": corrected_token_ids}
+            chunked_prompts = chunk_list([corrected_prompt], script_args.data_parallel_size)
+
+            for connection, prompts in zip(connections, chunked_prompts, strict=True):
+                if not prompts:
+                    prompts = [{"prompt_token_ids": [tokenizer.eos_token_id]}]
+                connection.send(
+                    {
+                        "type": "call",
+                        "method": "generate",
+                        "kwargs": {"prompts": prompts, "sampling_params": sampling_params},
+                    }
+                )
+        else:
+            # no prefix token IDs, use chat()
+            chunked_messages = chunk_list([messages], script_args.data_parallel_size)
+
+            for connection, message_chunk in zip(connections, chunked_messages, strict=True):
+                if not message_chunk:
+                    message_chunk = [[{"role": "user", "content": "<placeholder>"}]]
+                kwargs = {
+                    "messages": message_chunk,
+                    "sampling_params": sampling_params,
+                    "tools": request.tools,
+                    "chat_template_kwargs": chat_template_kwargs,
+                }
+                connection.send({"type": "call", "method": "chat", "kwargs": kwargs})
+
+        all_outputs = [connection.recv() for connection in connections]
+        if has_prefix_token_ids:
+            all_outputs = [
+                output for output, prompt_chunk in zip(all_outputs, chunked_prompts, strict=True) if prompt_chunk
+            ]
+        else:
+            all_outputs = [
+                output for output, msg_chunk in zip(all_outputs, chunked_messages, strict=True) if msg_chunk
+            ]
+        all_outputs = list(chain.from_iterable(all_outputs))
+
+        if not all_outputs:
+            return {
+                "id": completion_id,
+                "object": "chat.completion",
+                "created": created_at,
+                "model": request.model or script_args.model,
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {"role": "assistant", "content": ""},
+                        "finish_reason": "length",
+                        "logprobs": None,
+                    }
+                ],
+                "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+            }
+
+        choices = []
+        total_input_tokens = 0
+        total_output_tokens = 0
+
+        idx = 0
+        for output in all_outputs:
+            total_input_tokens += len(output.prompt_token_ids)
+
+            for gen_output in output.outputs:
+                total_output_tokens += len(gen_output.token_ids)
+                text = gen_output.text if hasattr(gen_output, "text") else ""
+
+                tool_calls = None
+                finish_reason = gen_output.finish_reason if hasattr(gen_output, "finish_reason") else "stop"
+
+                # Manual XML-json tool call parsing
+                if request.tools and text:
+                    pattern = r"<tool_call>(.*?)</tool_call>"
+                    matches = re.findall(pattern, text, re.DOTALL)
+                    if matches:
+                        tool_calls = []
+                        for match in matches:
+                            try:
+                                data = json.loads(match.strip())
+                                tool_calls.append(
+                                    {
+                                        "id": f"call_{uuid.uuid4().hex[:24]}",
+                                        "type": "function",
+                                        "function": {
+                                            "name": data.get("name", ""),
+                                            "arguments": json.dumps(data.get("arguments", {})),
+                                        },
+                                    }
+                                )
+                            except json.JSONDecodeError:
+                                continue
+                        if tool_calls:
+                            finish_reason = "tool_calls"
+                            text = re.sub(pattern, "", text, flags=re.DOTALL).strip()
+
+                if not request.parallel_tool_calls and tool_calls and len(tool_calls) > 1:
+                    tool_calls = [tool_calls[0]]
+
+                logprobs_data = None
+                if request.logprobs and hasattr(gen_output, "logprobs") and gen_output.logprobs:
+                    logprobs_data = {
+                        "content": [
+                            {
+                                "token": str(token_id),
+                                "logprob": float(list(logprob_dict.values())[0].logprob) if logprob_dict else 0.0,
+                                "bytes": None,
+                                "top_logprobs": [],
+                            }
+                            for token_id, logprob_dict in zip(gen_output.token_ids, gen_output.logprobs, strict=False)
+                        ]
+                    }
+
+                choices.append(
+                    {
+                        "index": idx,
+                        "message": {
+                            "role": "assistant",
+                            "content": text if not tool_calls else None,
+                            "tool_calls": tool_calls,
+                        },
+                        "logprobs": logprobs_data,
+                        "finish_reason": finish_reason,
+                    }
+                )
+                idx += 1
+
+        return {
+            "id": completion_id,
+            "object": "chat.completion",
+            "created": created_at,
+            "model": request.model or script_args.model,
+            "choices": choices,
+            "usage": {
+                "prompt_tokens": total_input_tokens,
+                "completion_tokens": total_output_tokens,
+                "total_tokens": total_input_tokens + total_output_tokens,
+            },
+        }
+
+    class TokenizeRequest(BaseModel):
+        model: str | None = None
+        messages: list[dict]
+        tools: list[dict] | None = None
+
+    @app.post("/tokenize")
+    async def tokenize(request: TokenizeRequest):
+        messages = request.messages
+
+        has_prefix_token_ids = any(msg.get("role") == "assistant" and "prompt_token_ids" in msg for msg in messages)
+
+        kwargs = {
+            "messages": [messages],
+            "tools": request.tools,
+            "add_generation_prompt": True,
+            "chat_template_kwargs": {},
+        }
+
+        connections[0].send({"type": "call", "method": "preprocess_chat", "kwargs": kwargs})
+        preprocessed_prompts = connections[0].recv()
+
+        if preprocessed_prompts and len(preprocessed_prompts) > 1:
+            logger.warning(
+                "More than one tokenized message returned from preprocess_chat inside tokenize, double check results!"
+            )
+
+        if not preprocessed_prompts or len(preprocessed_prompts) == 0:
+            return {"tokens": [], "model": request.model or script_args.model}
+
+        template_prompt = preprocessed_prompts[0]
+        result_tokens = template_prompt["prompt_token_ids"]
+
+        if has_prefix_token_ids:
+            tokenizer = app.state.tokenizer
+
+            # Extract model prefix tokens from last assistant message
+            model_prefix_tokens = None
+            last_assistant_idx = None
+            for i in reversed(range(len(messages))):
+                if messages[i].get("role") == "assistant":
+                    last_assistant_idx = i
+                    if "prompt_token_ids" in messages[i]:
+                        model_prefix_tokens = messages[i]["prompt_token_ids"] + messages[i].get(
+                            "generation_token_ids", []
+                        )
+                    break
+
+            if model_prefix_tokens and last_assistant_idx is not None:
+                # Preprocess up to last assistant
+                messages_to_last_assistant = messages[: last_assistant_idx + 1]
+                connections[0].send(
+                    {
+                        "type": "call",
+                        "method": "preprocess_chat",
+                        "kwargs": {
+                            "messages": [messages_to_last_assistant],
+                            "tools": request.tools,
+                            "add_generation_prompt": False,
+                            "chat_template_kwargs": {},
+                        },
+                    }
+                )
+                template_prefix_prompts = connections[0].recv()
+                template_prefix_token_ids = template_prefix_prompts[0]["prompt_token_ids"]
+
+                result_tokens = _replace_prefix_tokens(
+                    tokenizer, model_prefix_tokens, template_prefix_token_ids, template_prompt["prompt_token_ids"]
+                )
+
+        return {"tokens": result_tokens, "model": request.model or script_args.model}
+
+    # Start the server
+    uvicorn.run(
+        app,
+        host=script_args.host,
+        port=script_args.port,
+        log_level=script_args.log_level,
+        limit_concurrency=256,
+        backlog=4096,
+        timeout_keep_alive=600,
+    )
+
+
+def make_parser(subparsers: argparse._SubParsersAction | None = None):
+    if subparsers is not None:
+        parser = subparsers.add_parser("vllm-serve", help="Run the vLLM serve script", dataclass_types=ScriptArguments)
+    else:
+        parser = TrlParser(ScriptArguments)
+    return parser
+
+
+if __name__ == "__main__":
+    parser = make_parser()
+    (script_args,) = parser.parse_args_and_config()
+    main(script_args)
