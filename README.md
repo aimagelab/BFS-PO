@@ -64,7 +64,7 @@ The script ```trl/jobs/eval_bfs_po_lora_16_seeds.sh``` loads the adapter on top 
 
 ### Training
 
-The script ```bash trl/jobs/train_bfs_po_metamath.sh``` launches the training of [Qwen/Qwen3-1.7B](https://huggingface.co/Qwen/Qwen3-1.7B) with BFS-PO on [MetaMathQA-60k](https://huggingface.co/datasets/FiorenzoParascandolo/MetaMathQA-60k), evaluating on [MATH-500](https://huggingface.co/datasets/math-ai/math500) during training.
+The script ```trl/jobs/train_bfs_po_metamath.sh``` launches the training of [Qwen/Qwen3-1.7B](https://huggingface.co/Qwen/Qwen3-1.7B) with BFS-PO on [MetaMathQA-60k](https://huggingface.co/datasets/FiorenzoParascandolo/MetaMathQA-60k), evaluating on [MATH-500](https://huggingface.co/datasets/math-ai/math500) during training.
 
 ## Citation
 
